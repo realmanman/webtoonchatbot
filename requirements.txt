@@ -1,0 +1,17 @@
+streamlit
+pandas
+python-dotenv
+openai
+langchain
+langchain-community
+langchain-openai
+chromadb
+faiss-cpu
+tqdm
+huggingface-hub
+transformers
+scikit-learn
+sentence-transformers
+torch
+regex
+tiktoken
