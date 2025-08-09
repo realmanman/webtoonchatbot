@@ -5,21 +5,18 @@ from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma, FAISS
-from langchain_community.document_loaders import CSVLoader
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQAWithSourcesChain
-from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
+from langchain.prompts import ChatPromptTemplate
+
+from typing import Literal
+from pydantic import BaseModel, ValidationError
+from langchain.output_parsers import PydanticOutputParser
 from langchain.prompts import ChatPromptTemplate
 
 import re
 from pathlib import Path
-
-import sqlite3
-from datetime import datetime
-
-from langchain.chains import RetrievalQA
-from langchain.memory import ConversationSummaryBufferMemory
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
