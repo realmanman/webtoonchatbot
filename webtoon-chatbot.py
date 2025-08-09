@@ -80,6 +80,33 @@ def build_or_load_vectorstores():
 
 df, rag_chain, vectordb, retriever_info, memory_info = build_or_load_vectorstores()
 
+# Intent 결과 스키마 정의 (로그/분석)
+class IntentResult(BaseModel):
+    intent: Literal["법률", "정보", "현황", "추천"]
+    confidence: float  # 0.0 ~ 1.0
+    reasons: str
+
+# Structured Output 프롬프트
+intent_parser = PydanticOutputParser(pydantic_object=IntentResult)
+intent_prompt = ChatPromptTemplate.from_template(
+    """너는 아래 사용자 질문의 의도를 분류하는 분류기다.
+반드시 {format_instructions} 형식(JSON)으로만 출력해.
+
+규칙:
+- "법률": 2차 창작(드라마/영화/게임/애니 등) 관련 저작권/계약/법령/법적 이슈 문의
+- "정보": 작품 자체 정보(제목/줄거리/작가/등장인물/설정 등)
+- "추천": 2차 창작 목적의 '적합한 웹툰 추천' 요청 (2차 창작 언급 없으면 추천 아님)
+- "현황": 조회수/구독자수/평점/순위/연령·성별 선호도 등 통계·랭킹 요청
+
+출력 필드 가이드:
+- "intent": 위 4개 중 하나의 정확한 한글 라벨
+- "confidence": 0.0~1.0 (네가 이 분류에 얼마나 확신하는지)
+- "reasons": 짧게 근거 (한국어)
+
+사용자 질문: "{question}"
+"""
+)
+
 # ---- Intent/파싱 고도화 ----
 prompt_template_info = ChatPromptTemplate.from_messages([
     ("system", "너는 웹툰 전문가야. 반드시 웹툰 데이터베이스(검색 문서) 내 정보만 사용해. \
