@@ -10,16 +10,24 @@ from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import ChatPromptTemplate
 
-from typing import Literal
-from pydantic import BaseModel, ValidationError
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, ValidationError
 from langchain.output_parsers import PydanticOutputParser
 from langchain.prompts import ChatPromptTemplate
+from datetime import datetime, timezone
+from pathlib import Path
+import json, csv
 
 import re
-from pathlib import Path
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+    _KST = ZoneInfo("Asia/Seoul")
+except Exception:
+    _KST = timezone.utc  # 폴백 (UTC)
 ####################################################################################
 
 # OpenAI API Key 등록
@@ -28,8 +36,28 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("환경변수 OPENAI_API_KEY가 없습니다. .env에 설정해 주세요.")
 
-# LLM 설정
+# 본문 답변용 LLM 설정
 llm = ChatOpenAI(model="gpt-4o", temperature=0, max_tokens=1024)
+
+# 분류/추출 전용: 함수콜(Structured Output) LLM
+llm_struct = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=256)
+
+# Intent 결과 스키마 정의 (로그/분석)
+# ---------- Pydantic Schemas ----------
+class IntentResult(BaseModel):
+    intent: Literal["법률", "정보", "현황", "추천"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasons: str
+
+class FilterResult(BaseModel):
+    # 비어 있을 수도 있으니 Optional[str]
+    카테고리: Optional[str] = ""
+    연령층: Optional[Literal["10~20대", "30대", "40대", ""]] = ""
+    성별: Optional[Literal["남성", "여성", ""]] = ""
+
+# Pydantic으로 직접 파싱되는 래퍼 (툴콜 사용)
+intent_llm = llm_struct.with_structured_output(IntentResult)
+filter_llm = llm_struct.with_structured_output(FilterResult)
 
 # DB 경로
 WEBTOON_CSV_PATH = "./webtoon_data.csv" # 웹툰 통계 벡터DB
@@ -52,7 +80,7 @@ def build_or_load_vectorstores():
     Path(CHROMA_DIR).mkdir(parents=True, exist_ok=True)
     embeddings_hf = HuggingFaceEmbeddings(model_name="intfloat/multilingual-e5-base")
     vectordb = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings_hf)
-    retriever_law = vectordb.as_retriever(search_kwargs={"k": 10})
+    retriever_law = vectordb.as_retriever(search_kwargs={"k": 5})
     rag_chain_law = RetrievalQAWithSourcesChain.from_chain_type(llm=llm, retriever=retriever_law)
 
     # ---- 3) 웹툰 정보용 FAISS (없으면 CSV에서 즉시 빌드) ----
@@ -73,39 +101,208 @@ def build_or_load_vectorstores():
         vectorstore_info = FAISS.from_texts(records, embedding_info)
         vectorstore_info.save_local(FAISS_DB_DIR)
 
-    retriever_info = vectorstore_info.as_retriever(search_kwargs={"k": 10})
+    retriever_info = vectorstore_info.as_retriever(search_kwargs={"k": 5})
     memory_info = ConversationBufferMemory(memory_key="chat_history", return_messages=True, output_key="answer")
 
     return df, rag_chain_law, vectordb, retriever_info, memory_info
 
 df, rag_chain, vectordb, retriever_info, memory_info = build_or_load_vectorstores()
 
-# Intent 결과 스키마 정의 (로그/분석)
-class IntentResult(BaseModel):
-    intent: Literal["법률", "정보", "현황", "추천"]
-    confidence: float  # 0.0 ~ 1.0
-    reasons: str
-
-# Structured Output 프롬프트
-intent_parser = PydanticOutputParser(pydantic_object=IntentResult)
-intent_prompt = ChatPromptTemplate.from_template(
-    """너는 아래 사용자 질문의 의도를 분류하는 분류기다.
-반드시 {format_instructions} 형식(JSON)으로만 출력해.
-
+# ---------- 프롬프트 ----------
+intent_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     """너는 사용자 질문의 의도를 다음 중 하나로 정확히 분류한다.
 규칙:
 - "법률": 2차 창작(드라마/영화/게임/애니 등) 관련 저작권/계약/법령/법적 이슈 문의
 - "정보": 작품 자체 정보(제목/줄거리/작가/등장인물/설정 등)
 - "추천": 2차 창작 목적의 '적합한 웹툰 추천' 요청 (2차 창작 언급 없으면 추천 아님)
 - "현황": 조회수/구독자수/평점/순위/연령·성별 선호도 등 통계·랭킹 요청
-
-출력 필드 가이드:
-- "intent": 위 4개 중 하나의 정확한 한글 라벨
-- "confidence": 0.0~1.0 (네가 이 분류에 얼마나 확신하는지)
-- "reasons": 짧게 근거 (한국어)
-
-사용자 질문: "{question}"
 """
-)
+),
+    ("human", "질문: {question}\n하나의 라벨을 고르고, 신뢰도와 간단한 근거를 함께 내.")
+])
+
+filters_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "사용자 질문에서 추천/현황 분석에 필요한 필터를 추출한다. "
+     "카테고리(자유 텍스트), 연령층(10~20대/30대/40대/빈), 성별(남성/여성/빈)을 채워라."),
+    ("human", "질문: {question}")
+])
+
+def _strip_code_fences(text: str) -> str:
+    t = text.strip()
+    # ```json ... ``` or ``` ... ```
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"\s*```$", "", t)
+    return t.strip()
+
+def _regex_salvage(text: str) -> dict | None:
+    """
+    키 따옴표가 망가진 경우까지 긁어오기 위한 마지막 수단.
+    intent|confidence|reasons 키를 관대하게 탐지.
+    """
+    t = _strip_code_fences(text)
+    # 중괄호 블록만 먼저 추출
+    m = re.search(r'\{.*\}', t, flags=re.DOTALL)
+    if m:
+        t = m.group(0)
+    # 키:값 패턴 느슨하게 매칭 (따옴표 유무 허용)
+    kv = {}
+    for key in ["intent", "confidence", "reasons"]:
+        # 예: "''intent''" : "추천"  또는  intent: 추천
+        p = rf'["\'\s]*{key}["\'\s]*\s*:\s*(".*?"|\d+(\.\d+)?|true|false|null|[^,}}]+)'
+        mm = re.search(p, t, flags=re.IGNORECASE|re.DOTALL)
+        if mm:
+            rawv = mm.group(1).strip()
+            # 값에서 감싼 따옴표 제거
+            if rawv.startswith('"') and rawv.endswith('"'):
+                rawv = rawv[1:-1]
+            kv[key] = rawv
+    return kv or None
+
+def _normalize_quoted_keys(obj: dict) -> dict:
+    norm = {}
+    for k, v in obj.items():
+        kk = str(k)
+        # 앞뒤 중복 따옴표/공백 제거  e.g. "'\"intent\"'" → intent
+        kk = re.sub(r'^[\s\'"]+|[\s\'"]+$', "", kk)
+        norm[kk] = v
+    return norm
+
+def tolerant_pydantic_parse(text: str, model_cls: type[BaseModel]):
+    # 0) 그대로
+    for candidate in [text, _strip_code_fences(text)]:
+        try:
+            return model_cls.parse_obj(json.loads(candidate))
+        except Exception:
+            pass
+        # 단일따옴표 → 이중따옴표
+        try:
+            t2 = candidate.replace("'", '"')
+            obj = json.loads(t2)
+            obj = _normalize_quoted_keys(obj)
+            return model_cls.parse_obj(obj)
+        except Exception:
+            pass
+
+    # 1) ""intent"" → "intent" 교정
+    t3 = re.sub(r'"{2,}\s*([A-Za-z_][\w\- ]*)\s*"{2,}\s*:', r'"\1":', text)
+    try:
+        obj = json.loads(_strip_code_fences(t3))
+        obj = _normalize_quoted_keys(obj)
+        return model_cls.parse_obj(obj)
+    except Exception:
+        pass
+
+    # 2) 정규식 구조화(최후 수단)
+    salvaged = _regex_salvage(text)
+    if salvaged:
+        try:
+            # 결측 보정
+            if "confidence" in salvaged:
+                try:
+                    salvaged["confidence"] = float(salvaged["confidence"])
+                except Exception:
+                    salvaged["confidence"] = 0.0
+            salvaged.setdefault("reasons", "")
+            # intent 라벨 정규화
+            if "intent" in salvaged:
+                lbl = salvaged["intent"].strip()
+                # 오타/영문 대응
+                mapping = {
+                    "법률":"법률", "legal":"법률",
+                    "정보":"정보", "info":"정보",
+                    "현황":"현황", "status":"현황", "통계":"현황",
+                    "추천":"추천", "recommend":"추천"
+                }
+                salvaged["intent"] = mapping.get(lbl.lower(), lbl)
+            return model_cls.parse_obj(salvaged)
+        except Exception:
+            pass
+
+    return None
+
+# ---------- 의도 분류 + 로그 저장 ----------
+INTENT_LOG_PATH = Path("./intent_logs.csv")
+
+def _now_kst_str() -> str:
+    return datetime.now(tz=_KST).strftime("%Y-%m-%d %H:%M:%S%z")
+
+def log_intent_row(question: str, res: IntentResult, raw_payload: str = ""):
+    write_header = not INTENT_LOG_PATH.exists()
+    with INTENT_LOG_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["timestamp_kst","question","intent","confidence","reasons","raw"])
+        w.writerow([_now_kst_str(), question, res.intent, f"{res.confidence:.3f}", res.reasons, raw_payload])
+
+def _rule_based_fallback(q: str, default: str = "정보") -> str:
+    ql = q.lower()
+    law_kw = ["저작권","법","법률","계약","초상권","허가","라이선스","드라마화","영화화","각색","판권","ip","리메이크","원작 계약","섭외"]
+    status_kw = ["조회수","구독자수","평점","랭킹","순위","선호도","통계"]
+    rec_kw = ["추천","골라줘","픽","고르면","추천해","골라","뭘 볼까","추천 좀"]
+    if any(k in q for k in law_kw): return "법률"
+    if any(k in q for k in status_kw): return "현황"
+    if ("드라마" in q or "영화" in q or "게임" in q or "애니" in q) and any(k in ql for k in rec_kw): return "추천"
+    if any(k in ql for k in rec_kw): return "추천"
+    return default
+
+# ---------- 분류 ----------
+def classify_intent(question: str, confidence_threshold: float = 0.5) -> str:
+    # 1) 함수콜 기반 Structured Output (파싱 실패 거의 없음)
+    msgs = intent_prompt.format_messages(question=question)
+    res: IntentResult = intent_llm.invoke(msgs)
+    intent = res.intent
+    conf = max(0.0, min(1.0, float(res.confidence)))
+
+    # 2) 약하면 룰 보정
+    if conf < confidence_threshold:
+        intent = _rule_based_fallback(question, default=intent)
+
+    # 3) 원문 로그: 함수콜에선 raw JSON이 없으니, 모델 입력(질문)과 도출값을 JSON처럼 기록
+    raw_payload = f'{{"intent":"{res.intent}", "confidence":{res.confidence}, "reasons":"{res.reasons}"}}'
+    log_intent_row(question, res, raw_payload=raw_payload)
+    return intent
+
+def extract_filters_structured(question: str) -> dict:
+    raw = ""
+    try:
+        msgs = filters_prompt.format_messages(
+            format_instructions=filter_parser.get_format_instructions(),
+            question=question,
+        )
+        resp = llm_struct.invoke(msgs)  # ✅ JSON 강제
+        raw = resp.content or ""
+
+        try:
+            parsed: FilterResult = filter_parser.parse(raw)
+        except Exception:
+            parsed = tolerant_pydantic_parse(raw, FilterResult)
+            if parsed is None:
+                raise KeyError('filters_parse_failed')
+
+        return parsed.dict()
+
+    except Exception:
+        # 폴백
+        cond = {"카테고리": "", "연령층": "", "성별": ""}
+        cats = ["로맨스", "드라마", "액션", "무협", "스릴러", "판타지", "코미디", "학원", "스포츠", "공포"]
+        for c in cats:
+            if c in question:
+                cond["카테고리"] = c
+                break
+        if any(k in question for k in ["10대", "20대", "10~20대", "젊은", "청소년", "Z세대"]):
+            cond["연령층"] = "10~20대"
+        elif "30대" in question or "직장인" in question:
+            cond["연령층"] = "30대"
+        elif "40대" in question:
+            cond["연령층"] = "40대"
+        if "여성" in question or "여자" in question:
+            cond["성별"] = "여성"
+        elif "남성" in question or "남자" in question:
+            cond["성별"] = "남성"
+        return cond        
 
 # ---- Intent/파싱 고도화 ----
 prompt_template_info = ChatPromptTemplate.from_messages([
@@ -125,57 +322,16 @@ def custom_rag_chatbot(query, retriever, llm, memory):
     memory.chat_memory.add_ai_message(response.content)
     return response.content
 
-# 의도 분류를 구조화 출력으로 강제
-def classify_intent(question: str) -> str:
-    schema = """다음 중 하나만 출력: 법률 | 정보 | 현황 | 추천
-규칙:
-- '법률': 2차 창작(드라마/영화/게임/애니 등) 시의 법률/저작권/계약 등 법적 이슈
-- '정보': 제목/줄거리/작가/등장인물 등의 작품 자체 정보
-- '추천': 2차 창작 용도로 적합한 웹툰 추천 요구 (2차 창작 언급 없으면 추천 아님)
-- '현황': 조회수/구독자수/평점/순위/선호도 등 통계/랭킹
-질문: """ + question + "\n정답:"
-    ans = llm.predict(schema).strip()
-    if ans not in {"법률", "정보", "현황", "추천"}:
-        # fallback
-        if any(k in question for k in ["조회수", "구독자수", "평점", "순위", "선호도"]):
-            return "현황"
-        if any(k in question for k in ["추천", "골라줘", "뭐가 좋아"]):
-            return "추천"
-        return "정보"
-    return ans
-
-def extract_top_k(question: str, default_k=10) -> int:
+def extract_top_k(question: str, default_k=5) -> int:
     # 숫자 + (개|편|명|위|top) 패턴 다양화
     m = re.search(r"(?:상위|top\s*)?(\d+)\s*(?:개|편|명|위)?", question, re.IGNORECASE)
     if m:
         try:
             n = int(m.group(1))
-            return max(1, min(20, n))
+            return max(1, min(5, n))
         except:
             pass
     return default_k
-
-def extract_filter_conditions(question: str) -> dict:
-    prompt = f"""질문에서 아래 조건을 추출.
-- 카테고리: 장르 (로맨스/무협/드라마/액션/스릴러 등). 모르면 빈칸.
-- 연령층: 10~20대 / 30대 / 40대 중 택1. 모르면 빈칸.
-- 성별: 남성 / 여성 중 택1. 모르면 빈칸.
-
-출력 형식(그대로):
-카테고리:
-연령층:
-성별:
-
-질문: "{question}"
-"""
-    result = llm.predict(prompt).strip()
-    cond = {"카테고리": "", "연령층": "", "성별": ""}
-    for line in result.splitlines():
-        if ":" in line:
-            k, v = [s.strip() for s in line.split(":", 1)]
-            if k in cond:
-                cond[k] = v
-    return cond
 
 def _safe_contains(series: pd.Series, needle: str) -> pd.Series:
     if not needle:
@@ -183,8 +339,8 @@ def _safe_contains(series: pd.Series, needle: str) -> pd.Series:
     return series.fillna("").astype(str).str.contains(needle, case=False, na=False)
 
 def handle_recommendation(question: str) -> str:
-    k = extract_top_k(question, default_k=3)
-    cond = extract_filter_conditions(question)
+    k = extract_top_k(question, default_k=5)
+    cond = extract_filters_structured(question)
     filtered = df.copy()
 
     if "카테고리" in df.columns and cond["카테고리"]:
@@ -217,8 +373,8 @@ def handle_recommendation(question: str) -> str:
     return "\n".join(lines)
 
 def handle_status(question: str) -> str:
-    k = extract_top_k(question, default_k=3)
-    cond = extract_filter_conditions(question)
+    k = extract_top_k(question, default_k=5)
+    cond = extract_filters_structured(question)
     filtered = df.copy()
 
     if "카테고리" in df.columns and cond["카테고리"]:
@@ -275,7 +431,7 @@ if submitted and user_input:
     if intent == "법률":
         result = rag_chain(user_input)
         response = result["answer"]
-        chunks = vectordb.similarity_search(user_input, k=3)
+        chunks = vectordb.similarity_search(user_input, k=5)
     elif intent == "현황":
         response = handle_status(user_input)
     elif intent == "추천":
