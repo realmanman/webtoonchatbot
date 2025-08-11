@@ -1,10 +1,11 @@
-streamlit
-pandas
+fastapi
+uvicorn[standard]
 python-dotenv
-openai
+pandas
+pydantic
 langchain
-langchain-community
 langchain-openai
+langchain-community
 chromadb
 faiss-cpu
 tqdm
@@ -15,4 +16,3 @@ sentence-transformers
 torch
 regex
 tiktoken
-pydantic
